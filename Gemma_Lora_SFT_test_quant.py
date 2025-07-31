@@ -10,6 +10,9 @@
 
 
 # 0. 导包：
+import warnings
+warnings.filterwarnings("ignore", category=FutureWarning, module="torch.distributed.algorithms.ddp_comm_hooks") # 忽略torch的警告
+
 import os
 from datasets import load_dataset
 from datasets import load_from_disk
@@ -18,18 +21,20 @@ import torch
 from transformers import AutoProcessor, AutoModelForImageTextToText, BitsAndBytesConfig
 from trl import SFTTrainer
 from dist_check import dist_check
-from peft import LoraConfig
 from trl import SFTConfig
+from peft import LoraConfig
 from transformers import DefaultFlowCallback # 导入默认的东西
 from transformers import TrainerCallback
 import torch.distributed as dist
 from torch.distributed.algorithms.ddp_comm_hooks.default_hooks import allreduce_hook 
 import csv
+import argparse
 
 
+BASE_RESULT_DIR = "/gpfsnyu/scratch/zg2598/Gemma/gemma-3-4b-pt/"
 # 0. 准备工具函数：
 def quantlization_fuct(flat_tensor:torch.Tensor,
-                       scaling:int = int(1e6),
+                       scaling:float = None,
                        fp64_enable:bool = False):
     '''
     观察记录：
@@ -37,22 +42,21 @@ def quantlization_fuct(flat_tensor:torch.Tensor,
         但不知道为什么，经过测试后发现原来的scaling是可行的。
     
     '''
-    print(f"doing quantlization, scaling = {scaling}")
+    global Pioneer
+    if Pioneer:
+        print(f"doing quantlization, scaling = {scaling}")
     
     try:
         if fp64_enable:
             flat_tensor = flat_tensor.to(dtype=torch.float64)
             
         quantilized = torch.round(flat_tensor * scaling) / scaling
-        
+        if scaling is None:
+            quantilized = flat_tensor
         return quantilized
     
     except Exception as e:
         raise e    
-
-
-
-# 1. 准备数据集
 
 # System message for the assistant
 system_message = "You are an expert product description writer for Amazon."
@@ -69,8 +73,7 @@ Only return description. The description should be SEO optimized and for a bette
 {category}
 </CATEGORY>
 """
-
-# Convert dataset to OAI messages
+    # Convert dataset to OAI messages
 def format_data(sample):
     return {
         "messages": [
@@ -100,7 +103,6 @@ def format_data(sample):
             },
         ],
     }
-
 def process_vision_info(messages: list[dict]) -> list[Image.Image]:
     image_inputs = []
     # Iterate through each conversation
@@ -123,17 +125,25 @@ def process_vision_info(messages: list[dict]) -> list[Image.Image]:
                 image_inputs.append(image.convert("RGB"))
     return image_inputs
 
-# Load dataset from the hub/local disk
-# dataset = load_dataset("philschmid/amazon-product-descriptions-vlm", split="train")
-dataset_path = "/gpfsnyu/home/zg2598/datasets/philschmid_amazon-product-descriptions-vlm/"
-full_dataset = load_from_disk(dataset_path)
-dataset = full_dataset["train"]
-# Convert dataset to OAI messages
-# need to use list comprehension to keep Pil.Image type, .mape convert image to bytes
-dataset = [format_data(sample) for sample in dataset]
+# 1. 准备数据集
+def prepare_dataset(pioneer:bool = False):
 
-# if dist.get_rank() == 0: # 只在主进程打印信息
-print(f"example data:\n{dataset[345]['messages']}")
+    # Load dataset from the hub/local disk
+    # dataset = load_dataset("philschmid/amazon-product-descriptions-vlm", split="train")
+    dataset_path = "/gpfsnyu/home/zg2598/datasets/philschmid_amazon-product-descriptions-vlm/"
+    full_dataset = load_from_disk(dataset_path)
+    dataset = full_dataset["train"]
+    if pioneer:
+        dataset = dataset.select(range(10))  # 只取前10个样本，用于功能测试
+    # Convert dataset to OAI messages
+    # need to use list comprehension to keep Pil.Image type, .mape convert image to bytes
+    dataset = [format_data(sample) for sample in dataset]
+
+    # if dist.get_rank() == 0: # 只在主进程打印信息
+    print(f"example data:\n{dataset[345]['messages'] if not pioneer else dataset[-1]['messages']}")
+
+
+    return dataset
 
 # 2. 准备模型
 
@@ -191,53 +201,7 @@ processor = AutoProcessor.from_pretrained(processor_path)
 # if dist.get_rank() == 0: # 只在主进程打印信息
 print("Model loaded, Processor loaded...\nDONE!!!")
 
-# 3. 准备lora config:
 
-
-peft_config = LoraConfig(
-    lora_alpha=16,
-    lora_dropout=0.05,
-    r=16,
-    bias="none",
-    target_modules="all-linear",
-    task_type="CAUSAL_LM",
-    modules_to_save=[
-        "lm_head",
-        "embed_tokens",
-    ],
-    # 禁用 bnb 4bit 支持
-    use_rslora=False,
-    use_dora=False,
-)
-
-# 4. 准备SFTConfig和损失函数：
-
-
-args = SFTConfig(
-    output_dir="gemma-product-description",     # directory to save and repository id
-    num_train_epochs=1,                         # number of training epochs
-    per_device_train_batch_size=1,              # batch size per device during training
-    gradient_accumulation_steps=4,              # number of steps before performing a backward/update pass
-    gradient_checkpointing=True,                # use gradient checkpointing to save memory
-    optim="adamw_torch_fused",                  # use fused adamw optimizer
-    logging_steps=5,                            # log every 5 steps
-    save_strategy="no",                         # save checkpoint every epoch when doing actual experiment, but for debugging, we save nothing
-    learning_rate=2e-4,                         # learning rate, based on QLoRA paper
-    bf16=True,                                  # use bfloat16 precision
-    max_grad_norm=0.3,                          # max gradient norm based on QLoRA paper
-    warmup_ratio=0.03,                          # warmup ratio based on QLoRA paper
-    lr_scheduler_type="constant",               # use constant learning rate scheduler
-    
-    push_to_hub=False,                           # don't push model to hub !!!!!!!!!!
-    
-    report_to="tensorboard",                    # report metrics to tensorboard
-    gradient_checkpointing_kwargs={
-        "use_reentrant": False
-    },  # use reentrant checkpointing
-    dataset_text_field="",                      # need a dummy field for collator
-    dataset_kwargs={"skip_prepare_dataset": True},  # important for collator
-)
-args.remove_unused_columns = False # important for collator
 
 # Create a data collator to encode text and image pairs
 def collate_fn(examples):
@@ -327,6 +291,7 @@ def _allreduce_fut(
     )
     
 # --- hook本体 ---
+# --- hook本体 ---
 def mod_allreduce_hook_EG(
     process_group: dist.ProcessGroup, bucket: dist.GradBucket
 ) -> torch.futures.Future[torch.Tensor]:
@@ -352,12 +317,12 @@ def mod_allreduce_hook_EG(
     global CURRENT_STEP
     global save_Bucket
     global Scaling
+
     # --- 缓冲区里的扁平向量 --- 
     flat_tensor = bucket.buffer()
     # --- 基本信息 --- 
     global param_name_map
-    output_path = "/gpfsnyu/scratch/zg2598/Gemma/gemma-3-4b-pt/results/"
-    
+    global OUTPUT_DIR
     # 1. 知道这个是哪个rank:
     rank = dist.get_rank()
     
@@ -385,20 +350,18 @@ def mod_allreduce_hook_EG(
     ### 更新 ###
     
     # 1. 量化
-    if scaling is not None:
+    if Scaling is not None:
         quantized = quantlization_fuct(flat_tensor=flat_tensor,
                                        scaling=Scaling,
                                        fp64_enable=False)
-    else:
-        quantized = flat_tensor
-        
+        # set_buffer
+        bucket.set_buffer(quantized) # 2025年7月29日：测试量化后的表现 
     # 2. val2index
     
     # 3. EG Encoding
     
     
-    # set_buffer
-    bucket.set_buffer(quantized) # 2025年7月29日：测试量化后的表现
+
     
     
     # bucket.set_buffer(codes) # 将bucket的内容更改为EG encoding的结果: codes
@@ -413,9 +376,9 @@ def mod_allreduce_hook_EG(
     # 文件名称：
     file_name = f"R_{rank}_E_{the_epoch}_S_{the_step}_B_{idx}.pt"
     # 保存路径
-    save_dir = os.path.join(output_path, "COMMUNICATION_DATA_EG_Lora") # 更换了保存路径
-    os.makedirs(save_dir,exist_ok=True)
-    save_path = os.path.join(save_dir, file_name)
+
+    os.makedirs(OUTPUT_DIR,exist_ok=True)
+    save_path = os.path.join(OUTPUT_DIR, file_name)
     
 
     
@@ -457,14 +420,15 @@ contents:
 ===========
     """ 
     if the_epoch == 0 or 1: # 只保存前两个epoch的debug信息
-            
-        with open(f"{output_path}000_EG_Lora_DEBUG_INFO_{rank}.txt","a") as DEBUG_FILE:
+        to_path = os.path.join(OUTPUT_DIR,"000_EG_Full_DEBUG_INFO_{rank}.txt")
+        with open(to_path,"a") as DEBUG_FILE:
             DEBUG_FILE.write(INFO)
     
 
     # --- 原本的逻辑 ---
     return _allreduce_fut(process_group, bucket.buffer())
 
+# HookedSFTTrainer类：
 # HookedSFTTrainer类：
 
 class HookedSFTTrainer(SFTTrainer):
@@ -514,6 +478,7 @@ class HookedSFTTrainer(SFTTrainer):
                 model.module.type:
                 {model.module.type}
                 '''
+                    os.makedirs(self.output_path,exist_ok=True)
                     file_path = os.path.join(self.output_path, f"001_model_info_rank_{dist.get_rank()}.txt")
                     with open(file_path, "a") as f:
                         f.write(model_info)
@@ -532,15 +497,6 @@ class HookedSFTTrainer(SFTTrainer):
                 self.epoch_step_config_1 = epoch_step_config_1
                 
                 print("config initiallized!!!")
-                # # Write param_name_map to a CSV file
-                # param_map_path = "/gpfsnyu/scratch/zg2598/Qwen/OUT/COMMUNICATION_LOG/param_name_map_rank_{}.csv".format(dist.get_rank())
-                # with open(param_map_path, "w", newline="") as csvfile:
-                #     writer = csv.writer(csvfile)
-                #     writer.writerow(["pid", "name"])
-                #     for pid, name in param_name_map.items():
-                #         writer.writerow([pid, name])
-
-                # print(list(model.named_parameters()))
                 print("registering HOOKS")
                 model.register_comm_hook(state=None, hook=mod_allreduce_hook_EG)
                 self.hook_registered = True
@@ -565,13 +521,75 @@ class HookedSFTTrainer(SFTTrainer):
         # ---调用本家的东西 --- 
         return super().training_step(model,inputs,num_items_in_batch)
 
-def main(save_bucket = False,scaling = None):
+def main(save_bucket = False,scaling = None,pioneer = False, output_dir_name = None):
     global save_Bucket
     global Scaling
+    global Pioneer
     save_Bucket = save_bucket
     Scaling = scaling
+    Pioneer = pioneer
     print(f"SAVING BUCKET???\n--{save_Bucket}")
     
+    dataset = prepare_dataset(pioneer=pioneer)
+    
+    
+    # 3. 准备SFTConfig和损失函数：
+    if output_dir_name is None:
+        output_dir_name = "result_None"
+    save_dir = os.path.join(BASE_RESULT_DIR,f"result_{output_dir_name}")
+    global OUTPUT_DIR 
+    OUTPUT_DIR = os.path.join(save_dir,"COMMUNICATION_LOG")
+    
+    # 3. 准备lora config:
+
+
+    peft_config = LoraConfig(
+        lora_alpha=16,
+        lora_dropout=0.05,
+        r=16,
+        bias="none",
+        target_modules="all-linear",
+        task_type="CAUSAL_LM",
+        modules_to_save=[
+            "lm_head",
+            "embed_tokens",
+        ],
+        # 禁用 bnb 4bit 支持
+        use_rslora=False,
+        use_dora=False,
+)
+
+    # 4. 准备SFTConfig和损失函数：
+
+
+    args = SFTConfig(
+        output_dir=save_dir,     # directory to save and repository id
+        num_train_epochs=1,                         # number of training epochs
+        per_device_train_batch_size=1,              # batch size per device during training
+        gradient_accumulation_steps=4,              # number of steps before performing a backward/update pass
+        gradient_checkpointing=True,                # use gradient checkpointing to save memory
+        optim="adamw_torch_fused",                  # use fused adamw optimizer
+        logging_steps=5,                            # log every 5 steps
+        save_strategy="no",                         # save checkpoint every epoch when doing actual experiment, but for debugging, we save nothing
+        learning_rate=2e-4,                         # learning rate, based on QLoRA paper
+        bf16=True,                                  # use bfloat16 precision
+        max_grad_norm=0.3,                          # max gradient norm based on QLoRA paper
+        warmup_ratio=0.03,                          # warmup ratio based on QLoRA paper
+        lr_scheduler_type="constant",               # use constant learning rate scheduler
+        
+        push_to_hub=False,                           # don't push model to hub !!!!!!!!!!
+        
+        # report_to=["tensorboard","csv"],           # report metrics to tensorboard and csv
+        report_to="tensorboard",                  
+        gradient_checkpointing_kwargs={
+            "use_reentrant": False
+        },  # use reentrant checkpointing
+        dataset_text_field="",                      # need a dummy field for collator
+        dataset_kwargs={"skip_prepare_dataset": True},  # important for collator
+    )
+    args.remove_unused_columns = False # important for collator
+    print(f"results will be saved to\n{args.output_dir}")
+        
     # 6. 准备训练器
     hooked_trainer = HookedSFTTrainer(
         model=model,
@@ -582,16 +600,32 @@ def main(save_bucket = False,scaling = None):
         data_collator=collate_fn,
         callbacks = [EPOCH_STEP_HANDLER()]
     )
-    hooked_trainer.output_path = "/gpfsnyu/scratch/zg2598/Gemma/gemma-3-4b-pt/results/"
     # 7. 开始训练
     # if dist.get_rank() == 0: # 只在主进程打印信息
     print("Training begin...")
     hooked_trainer.train()
+    # hooked_trainer.save_model() # 2025年7月31日14:02:28修改
+    dist.destroy_process_group() # 结束分布式
 
 
 if __name__ == "__main__":
-    scaling = 1e6
-    save_bucket = False
-    main(save_bucket = save_bucket,
-         scaling = scaling)
-    
+    if not dist.is_initialized():
+        dist.init_process_group(
+            backend="nccl",  # 或 gloo/ccl/xla，根据你设备
+            init_method="env://",  # torchrun 会自动设置 env
+        )
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--scaling", type=float, default=None, required=False) # scaling的参数
+    parser.add_argument("--save_bucket", action="store_true", default=False) #是否保存bucket
+    parser.add_argument("--pioneer", action="store_true", default=False) # 用非常小的子集对进行新的feature测试
+    parser.add_argument("--scaling_str", type=str, required=False, help="Original string of scaling (for dir name)", default=None)
+    args_ = parser.parse_args()
+
+    save_bucket = args_.save_bucket
+    scaling = args_.scaling
+    pioneer = args_.pioneer
+    output_dir_name = args_.scaling_str
+
+
+    main(save_bucket=save_bucket, scaling=scaling, pioneer=pioneer,output_dir_name = output_dir_name)
+
