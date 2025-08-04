@@ -22,7 +22,6 @@ from PIL import Image
 import torch
 from transformers import AutoProcessor, AutoModelForImageTextToText, BitsAndBytesConfig
 from trl import SFTTrainer
-from dist_check import dist_check
 from trl import SFTConfig
 from transformers import DefaultFlowCallback # 导入默认的东西
 from transformers import TrainerCallback
@@ -30,10 +29,21 @@ import torch.distributed as dist
 from torch.distributed.algorithms.ddp_comm_hooks.default_hooks import allreduce_hook 
 import csv
 import argparse
-
+import time
+import json
 
 BASE_RESULT_DIR = "/gpfsnyu/scratch/zg2598/Gemma/gemma-3-4b-pt/"
 # 0. 准备工具函数：
+def dist_check():
+    if dist.is_available():
+        print(f"Distributed available: ✅")
+        if dist.is_initialized():
+            print(f"Distributed initialized: ✅ (rank={dist.get_rank()})")
+        else:
+            print("Distributed available, but not initialized ❌")
+    else:
+        print("Distributed not available ❌")
+
 def quantlization_fuct(flat_tensor:torch.Tensor,
                        scaling:float = None,
                        fp64_enable:bool = False):
@@ -220,10 +230,35 @@ def collate_fn(examples):
 
 
 # EPOCH 和 STEP 怎么找：
-
+# EPOCH 和 STEP 怎么找：
+def rewrite_logs(d):
+    new_d = {}
+    eval_prefix = "eval_"
+    eval_prefix_len = len(eval_prefix)
+    test_prefix = "test_"
+    test_prefix_len = len(test_prefix)
+    for k, v in d.items():
+        if k.startswith(eval_prefix):
+            new_d["eval/" + k[eval_prefix_len:]] = v
+        elif k.startswith(test_prefix):
+            new_d["test/" + k[test_prefix_len:]] = v
+        else:
+            new_d["train/" + k] = v
+    return new_d
 
 class EPOCH_STEP_HANDLER(TrainerCallback):
 # class EPOCH_STEP_HANDLER(DefaultFlowCallback):
+    def __init__(self, filename="training_log.csv"):
+        self.filename = filename
+        self.fieldnames = None
+        self.csv_file = None
+        self.writer = None
+
+        
+    def is_main_process(self):
+        if not torch.distributed.is_available() or not torch.distributed.is_initialized():
+            return True
+        return torch.distributed.get_rank() == 0
     def on_epoch_begin(self, args, state, control, **kwargs):
         """
         Event called at the beginning of an epoch.
@@ -244,15 +279,49 @@ class EPOCH_STEP_HANDLER(TrainerCallback):
         
         return super().on_step_begin(args, state, control, **kwargs)
 
+    def on_log(self, args, state, control, logs=None, **kwargs):
+        if not self.is_main_process():
+            return  # ⛔ 非主进程不写日志
 
+        try:
+            if logs is None:
+                return
 
+            # ✅ 你要求的固定开头部分
+            logs = rewrite_logs(logs)
+            the_output_dir = args.output_dir
+            csv_dir = os.path.join(the_output_dir, "TRAINING_LOG")
+            os.makedirs(csv_dir, exist_ok=True)
+            csv_path = os.path.join(csv_dir, self.filename)
+
+            # 当前 step 的字段
+            current_keys = ["step", "time"] + list(logs.keys())
+
+            # 初始化 CSV 写入器
+            if self.writer is None:
+                self.csv_file = open(csv_path, mode="w", newline="")
+                self.fieldnames = current_keys
+                self.writer = csv.DictWriter(self.csv_file, fieldnames=self.fieldnames)
+                self.writer.writeheader()
+
+            # 写入当前 row
+            row = {
+                "step": state.global_step,
+                "time": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
+            }
+            for key in self.fieldnames:
+                if key not in row:  # 跳过 step 和 time，因为已经加了
+                    row[key] = logs.get(key, "")
+            self.writer.writerow(row)
+            self.csv_file.flush()
+
+        except Exception as e:
+            print(f"CSV Logging Error: {e}")
+
+    def on_train_end(self, args, state, control, **kwargs):
+        if self.csv_file:
+            self.csv_file.close()
 # DDP钩子：
-
-#           dummy hook： allreduce_hook (默认DDP钩子，不改变行为）
-
-
-#           mod_allreduce_hook: 添加读取和保存的信息：
-
 # --- helper function ---
 def _allreduce_fut(
     process_group: dist.ProcessGroup, tensor: torch.Tensor
@@ -398,7 +467,7 @@ contents:
 ===========
     """ 
     if the_epoch == 0 or 1: # 只保存前两个epoch的debug信息
-        to_path = os.path.join(OUTPUT_DIR,"000_EG_Full_DEBUG_INFO_{rank}.txt")
+        to_path = os.path.join(OUTPUT_DIR,f"000_EG_Full_DEBUG_INFO_{rank}.txt")
         with open(to_path,"a") as DEBUG_FILE:
             DEBUG_FILE.write(INFO)
     
@@ -557,8 +626,35 @@ def main(save_bucket = False,scaling = None,pioneer = False, output_dir_name = N
     # 7. 开始训练
     # if dist.get_rank() == 0: # 只在主进程打印信息
     print("Training begin...")
-    hooked_trainer.train()
-    # hooked_trainer.save_model() # 2025年7月31日14:02:28修改
+    train_output = hooked_trainer.train()
+    
+    try:
+        # 取当前 rank
+        rank = dist.get_rank() if dist.is_initialized() else 0
+
+        
+        train_output_dir = os.path.join(os.path.dirname(__file__),"TRAINER_OUTPUT")
+        os.makedirs(train_output_dir,exist_ok=True)
+        date_str = time.strftime("%Y%m%d")
+        jsonl_path = os.path.join(train_output_dir, f"Qwen_Full_{date_str}_rank{rank}.jsonl")
+        
+        # 构造记录
+        record = {
+            "rank": rank,
+            "scaling": output_dir_name,  # 假设你在主函数中传进来的
+            "global_step": train_output.global_step,
+            "training_loss": train_output.training_loss,
+            **train_output.metrics  # 合并 metrics 字典 
+        }
+        
+        # 写入 jsonl（每条记录一行）
+        with open(jsonl_path, "a") as f:
+            f.write(json.dumps(record) + "\n")
+
+        print(f"=========================\nTrainOutput saved to {jsonl_path}\n=========================\n")
+    except Exception as e:
+        print(f"TrainOutput unable to save: \n{e}\n")   
+    
     dist.destroy_process_group() # 结束分布式
 
 
