@@ -4,8 +4,11 @@
 ### CONFIGS ###
 
 # 设置你的训练脚本路径
-SCRIPT_PATH_FULL="/gpfsnyu/scratch/zg2598/Gemma/gemma-3-4b-pt/scripts/Gemma_Full_SFT_test_quant.py"
-SCRIPT_PATH_LORA="/gpfsnyu/scratch/zg2598/Gemma/gemma-3-4b-pt/scripts/Gemma_Lora_SFT_test_quant.py"
+# SCRIPT_PATH_FULL="/gpfsnyu/scratch/zg2598/Gemma/gemma-3-4b-pt/scripts/Gemma_Full_SFT_test_quant.py"
+# SCRIPT_PATH_LORA="/gpfsnyu/scratch/zg2598/Gemma/gemma-3-4b-pt/scripts/Gemma_Lora_SFT_test_quant.py"
+
+SCRIPT_PATH_FULL="/gpfsnyu/scratch/zg2598/Gemma/gemma-3-4b-pt/scripts/Gemma_Full_SFT_test_parameters.py"
+SCRIPT_PATH_LORA="/gpfsnyu/scratch/zg2598/Gemma/gemma-3-4b-pt/scripts/Gemma_Lora_SFT_test_parameters.py"
 
 # 是否要保存通信文件
 SAVE_BUCKET=true
@@ -63,38 +66,38 @@ done
 #############################
 echo "RUNNING Lora_SFT...."
 
-# ✅ 选择当前要使用的脚本
-SCRIPT_PATH="$SCRIPT_PATH_LORA"  # ← 改成 LORA 脚本也只需修改这行
+# # ✅ 选择当前要使用的脚本
+# SCRIPT_PATH="$SCRIPT_PATH_LORA"  # ← 改成 LORA 脚本也只需修改这行
 
-# 遍历所有 scaling 值
-for scaling in "${SCALING_VALUES[@]}"; do
-    echo "==============================="
-    echo "Starting training with scaling=${scaling}"
+# # 遍历所有 scaling 值
+# for scaling in "${SCALING_VALUES[@]}"; do
+#     echo "==============================="
+#     echo "Starting training with scaling=${scaling}"
 
-    # 生成命令
-    CMD="torchrun --nproc_per_node=${NPROC_PER_NODE} ${SCRIPT_PATH}"
+#     # 生成命令
+#     CMD="torchrun --nproc_per_node=${NPROC_PER_NODE} ${SCRIPT_PATH}"
 
-    # 如果 scaling 不是 None，就加参数
-    if [[ "$scaling" != "None" ]]; then
-        CMD+=" --scaling ${scaling}"
-    fi
+#     # 如果 scaling 不是 None，就加参数
+#     if [[ "$scaling" != "None" ]]; then
+#         CMD+=" --scaling ${scaling}"
+#     fi
 
-    # 如果启用 pioneer 模式
-    if [[ "$USE_PIONEER" == true ]]; then
-        CMD+=" --pioneer"
-    fi
+#     # 如果启用 pioneer 模式
+#     if [[ "$USE_PIONEER" == true ]]; then
+#         CMD+=" --pioneer"
+#     fi
     
-    if [["$SAVE_BUCKET" == true]]; then
-        CMD+=" --save_bucket"
-    fi
+#     if [["$SAVE_BUCKET" == true]]; then
+#         CMD+=" --save_bucket"
+#     fi
 
-    echo "Running command:"
-    echo "$CMD"
-    eval "$CMD"
+#     echo "Running command:"
+#     echo "$CMD"
+#     eval "$CMD"
 
-    echo "Finished run with scaling=${scaling}"
-    echo "==============================="
-    echo ""
-done
+#     echo "Finished run with scaling=${scaling}"
+#     echo "==============================="
+#     echo ""
+# done
 
 echo "ALL COMPLETED..."
