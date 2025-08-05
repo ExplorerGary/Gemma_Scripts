@@ -33,6 +33,9 @@ import time
 import json
 
 BASE_RESULT_DIR = "/gpfsnyu/scratch/zg2598/Gemma/gemma-3-4b-pt/"
+# --- global vars --- 
+# 拼接 gamma_table.pt 的绝对路径
+N
 
 fieldnames = ["bucket_name","entropy","gamma","beta","mu"]
 
@@ -343,25 +346,6 @@ def cal_entropy(flat_tensor:torch.Tensor):
         entropy = -torch.sum(probs * torch.log2(probs)).item()
     
     return entropy
-
-def load_gamma_tables_from_rank0():
-    base_dir = os.path.dirname(__file__)
-    gamma_path = os.path.join(base_dir, "data_to_use", "gamma_table.pt")
-    rgamma_path = os.path.join(base_dir, "data_to_use", "r_gamma_table.pt")
-
-    # 先从 rank 0 加载 tensor
-    if dist.get_rank() == 0:
-        gamma_table = torch.load(gamma_path).to("cpu")
-        r_gamma_table = torch.load(rgamma_path).to("cpu")
-    else:
-        gamma_table = torch.empty((EXPECTED_SIZE,), dtype=torch.float32)
-        r_gamma_table = torch.empty((EXPECTED_SIZE,), dtype=torch.float32)
-
-    # 广播
-    dist.broadcast(gamma_table, src=0)
-    dist.broadcast(r_gamma_table, src=0)
-
-    return gamma_table, r_gamma_table
 
 def cal_distribution(flat_tensor:torch.Tensor,
                      sample_enabled:bool=False, # 是否采样
