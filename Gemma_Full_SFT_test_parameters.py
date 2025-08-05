@@ -369,7 +369,7 @@ def get_tables():
 
 def cal_distribution(flat_tensor:torch.Tensor,
                      sample_enabled:bool=False, # 是否采样
-                     sample_size:int = 10000, # 采样多少
+                     sample_size:int = 1000000, # 采样多少
                      to64 = False, # 是否需要转化为fp64
                     ) -> dict: 
     global gemma_table, r_gemma_table
@@ -453,7 +453,7 @@ def Info_Calculation_Hook(
     
     # 4.2 计算
     entropy = cal_entropy(flat_tensor=flat_tensor,
-                          sample_size=100000000,
+                          sample_size=1000000,
                           seed=42)
     ans = cal_distribution(flat_tensor=flat_tensor,
                                     sample_enabled=True,
