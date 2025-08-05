@@ -536,6 +536,7 @@ class HookedSFTTrainer(SFTTrainer):
         return super().training_step(model,inputs,num_items_in_batch)
 
 def main(save_bucket = False,scaling = None,pioneer = False, output_dir_name = None):
+    rank = dist.get_rank()
     global save_Bucket
     global Scaling
     global Pioneer
@@ -550,13 +551,13 @@ def main(save_bucket = False,scaling = None,pioneer = False, output_dir_name = N
     
     # 3. 准备SFTConfig和损失函数：
     if output_dir_name is None:
-        output_dir_name = "result_None"
-    save_dir = os.path.join(BASE_RESULT_DIR,f"result_{output_dir_name}")
+        output_dir_name = "None"
+    save_dir = os.path.join(BASE_RESULT_DIR,f"result_Full_{output_dir_name}")
     global OUTPUT_DIR 
     OUTPUT_DIR = os.path.join(save_dir,"COMMUNICATION_LOG")
     
     # make statics collecting csv:
-    static_csv_path = os.path.join(OUTPUT_DIR,"002_BUCKET_STATICS.csv")
+    static_csv_path = os.path.join(OUTPUT_DIR,f"002_BUCKET_STATICS_rank{rank}.csv")
     with open(static_csv_path,mode='w', newline='', encoding='utf-8') as csvfile:
         writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
         writer.writeheader()
