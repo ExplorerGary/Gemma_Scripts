@@ -35,7 +35,8 @@ import json
 BASE_RESULT_DIR = "/gpfsnyu/scratch/zg2598/Gemma/gemma-3-4b-pt/"
 
 fieldnames = ["bucket_name","entropy","gamma","beta","mu"]
-
+gemma_table = None
+r_gemma_table = None
 
 # 0. 准备工具函数：
 def dist_check():
@@ -344,31 +345,25 @@ def cal_entropy(flat_tensor:torch.Tensor):
     
     return entropy
 
-def load_gamma_tables_from_rank0():
+def get_tables():
+    local_rank = int(os.environ.get("LOCAL_RANK", 0))
     base_dir = os.path.dirname(__file__)
-    gamma_path = os.path.join(base_dir, "data_to_use", "gamma_table.pt")
-    rgamma_path = os.path.join(base_dir, "data_to_use", "r_gamma_table.pt")
+    gemma_table_path = os.path.join(base_dir,"data_to_use",f"gamma_table_{local_rank}.pt")
+    r_gemma_table_path = os.path.join(base_dir,"data_to_use",f"r_gamma_table_{local_rank}.pt")
 
-    # 先从 rank 0 加载 tensor
-    if dist.get_rank() == 0:
-        gamma_table = torch.load(gamma_path).to("cpu")
-        r_gamma_table = torch.load(rgamma_path).to("cpu")
-    else:
-        gamma_table = torch.empty((EXPECTED_SIZE,), dtype=torch.float32)
-        r_gamma_table = torch.empty((EXPECTED_SIZE,), dtype=torch.float32)
+    gemma_table = torch.load(gemma_table_path).to(f"cuda:{local_rank}")
+    r_gemma_table = torch.load(r_gemma_table_path).to(f"cuda:{local_rank}")
+    
+    return gemma_table,r_gemma_table
 
-    # 广播
-    dist.broadcast(gamma_table, src=0)
-    dist.broadcast(r_gamma_table, src=0)
-
-    return gamma_table, r_gamma_table
 
 def cal_distribution(flat_tensor:torch.Tensor,
                      sample_enabled:bool=False, # 是否采样
                      sample_size:int = 10000, # 采样多少
-                     to64 = False # 是否需要转化为fp64
-                     ) -> dict: 
-
+                     to64 = False, # 是否需要转化为fp64
+                    ) -> dict: 
+    global gemma_table, r_gemma_table
+    
     if Pioneer:
         print("calculating shape_parameters")
     with torch.no_grad():
@@ -388,9 +383,9 @@ def cal_distribution(flat_tensor:torch.Tensor,
         r_gamma = (n * var / mean ** 2).to(device=torch.device("cpu"))
         
         # find the closest value in r_gamma_table
-        pos = torch.argmin(torch.abs(r_gamma - r_gamma_table))
+        pos = torch.argmin(torch.abs(r_gamma - r_gemma_table))
         
-        shape = gamma_table[pos].item()
+        shape = gemma_table[pos].item()
         std = torch.sqrt(var / n).item()
         n = torch.tensor(n).item()
         mu = torch.mean(flat_tensor).item()
@@ -456,14 +451,13 @@ def Info_Calculation_Hook(
     ans["bucket_name"] = bucket_name
     ans["entropy"] = entropy
 
-    csv_path = os.path.join(OUTPUT_DIR,"002_BUCKET_STATICS.csv")
+    csv_path = os.path.join(OUTPUT_DIR,f"002_BUCKET_STATICS_rank{rank}.csv")
     with open(csv_path, mode='a', newline='', encoding='utf-8') as csvfile:
         writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
         writer.writerow(ans)
-
-
     # --- 原本的逻辑 ---
     return _allreduce_fut(process_group, bucket.buffer())
+
 # HookedSFTTrainer类：
 
 class HookedSFTTrainer(SFTTrainer):
@@ -538,21 +532,6 @@ class HookedSFTTrainer(SFTTrainer):
                 print("HOOKED!!!")
             except Exception as e:
                 print(f"Something bad happened: {e}")
-
-
-
-                
-        # --- 发现 ---
-        # 经过试验，明确 self.model_wrapped才是我们需要处理的东西，用这个注册DDP钩子准备抓取数据！
-        # if dist.is_initialized() and dist.get_rank() == 0:
-        #     print(f"self.model type in training_step: {type(self.model)}")
-        #     print(f"self.model_wrapped type in training_step: {type(self.model_wrapped)}") # 已知这个才是我们要找的对象。
-        #     # print(self.model == model)
-        #     # print(self.model_wrapped == model)
-        # 因此，_wrap_model就没必要修改了
-
-
-        
         # ---调用本家的东西 --- 
         return super().training_step(model,inputs,num_items_in_batch)
 
@@ -560,6 +539,8 @@ def main(save_bucket = False,scaling = None,pioneer = False, output_dir_name = N
     global save_Bucket
     global Scaling
     global Pioneer
+    global gemma_table,r_gemma_table
+    gemma_table,r_gemma_table = get_tables()
     save_Bucket = save_bucket
     Scaling = scaling
     Pioneer = pioneer
