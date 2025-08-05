@@ -334,12 +334,22 @@ def _allreduce_fut(
         .get_future()
         .then(lambda fut: fut.value()[0])
     )
-def cal_entropy(flat_tensor:torch.Tensor):
+def cal_entropy(flat_tensor: torch.Tensor, sample_size: int = 100000000, seed:int = 42) -> float:
     global Pioneer
     if Pioneer:
         print("calculating entropy")
+    
     with torch.no_grad():
-        unique_vals, counts = flat_tensor.unique(return_counts=True)
+        # If tensor size is smaller than sample_size, use the whole tensor
+        if flat_tensor.numel() <= sample_size:
+            sample = flat_tensor
+        else:
+            # Randomly sample indices with a fixed seed
+            indices = torch.randperm(flat_tensor.numel(), generator=torch.Generator().manual_seed(seed))[:sample_size]
+            sample = flat_tensor[indices]
+            
+        # Calculate entropy using sampled data
+        unique_vals, counts = sample.unique(return_counts=True)
         probs = counts.float() / counts.sum()
         entropy = -torch.sum(probs * torch.log2(probs)).item()
     
@@ -442,7 +452,9 @@ def Info_Calculation_Hook(
     bucket_name = f"R_{rank}_E_{the_epoch}_S_{the_step}_B_{idx}"
     
     # 4.2 计算
-    entropy = cal_entropy(flat_tensor=flat_tensor)
+    entropy = cal_entropy(flat_tensor=flat_tensor,
+                          sample_size=100000000,
+                          seed=42)
     ans = cal_distribution(flat_tensor=flat_tensor,
                                     sample_enabled=True,
                                     sample_size=10000,
