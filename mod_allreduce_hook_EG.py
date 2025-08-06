@@ -235,8 +235,37 @@ contents:
     return _allreduce_fut(process_group, bucket.buffer())
 
     
+def Truncate_Hook(
+    process_group: dist.ProcessGroup, bucket: dist.GradBucket
+) -> torch.futures.Future[torch.Tensor]:
+    global Pioneer
 
-
+    flat_tensor = bucket.buffer()
+    
+    
+    
+    
+    def truncate(flat_tensor):
+        global mode
+        if Pioneer:
+            print('truncating...')
+        if mode == "fp12":
+            pass
+        elif mode == "fp8":
+            pass
+        elif mode == "fp4":
+            pass
+        
+        
+        pass
+    
+    truncated = truncate(flat_tensor)
+    
+    bucket.set_buffer(truncated)
+    
+    return _allreduce_fut(process_group, bucket.buffer())
+    
+    
 def Info_Calculation_Hook(
     process_group: dist.ProcessGroup, bucket: dist.GradBucket
 ) -> torch.futures.Future[torch.Tensor]:
